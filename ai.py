@@ -10,8 +10,7 @@ from PIL import Image
 
 # ------------------ 設定儲存路徑 ------------------
 MODEL_DIR = "model_data"
-if not os.path.exists(MODEL_DIR):
-  os.makedirs(MODEL_DIR)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 MODEL_PATH = os.path.join(MODEL_DIR, "face_model.yml")
 LABELS_PATH = os.path.join(MODEL_DIR, "labels.pickle")
