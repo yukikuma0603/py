@@ -1,5 +1,6 @@
 import os
 import pickle
+import shutil
 import cv2
 import numpy as np
 import streamlit as st
@@ -195,13 +196,138 @@ def load_detection_model():
   return model
 
 
+# 載入自定義 LBPH 人臉模型
+def load_face_model():
+  recognizer = None
+  label_map = {}
+  has_custom_model = False
+  if os.path.exists(MODEL_PATH) and os.path.exists(LABELS_PATH):
+    try:
+      recognizer = cv2.face.LBPHFaceRecognizer_create()
+      recognizer.read(MODEL_PATH)
+      with open(LABELS_PATH, "rb") as f:
+        loaded_data = pickle.load(f)
+
+      for k, v in loaded_data.items():
+        if isinstance(v, str):
+          label_map[k] = {"name": v, "code": ""}
+        else:
+          label_map[k] = v
+
+      if len(label_map) > 0:
+        has_custom_model = True
+    except Exception:
+      pass
+  return recognizer, label_map, has_custom_model
+
+
+# 過濾重複框（NMS）
+def filter_valid_indices(boxes, labels, scores):
+  valid_indices = []
+  for i, (bbox, label_idx, score) in enumerate(zip(boxes, labels, scores)):
+    eng_name = _COCO_INSTANCE_CATEGORY_NAMES[label_idx]
+    if score >= 0.7:
+      if eng_name == "person":
+        is_redundant = False
+        for j in valid_indices:
+          jb = boxes[j]
+          inter_x0 = max(bbox[0], jb[0])
+          inter_y0 = max(bbox[1], jb[1])
+          inter_x1 = min(bbox[2], jb[2])
+          inter_y1 = min(bbox[3], jb[3])
+          inter_area = max(0, inter_x1 - inter_x0) * max(
+              0, inter_y1 - inter_y0
+          )
+          box_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+          if inter_area / (box_area + 1e-5) > 0.3:
+            is_redundant = True
+            break
+        if not is_redundant:
+          valid_indices.append(i)
+      else:
+        if score >= 0.6:
+          valid_indices.append(i)
+  return valid_indices
+
+
+# 畫外框與標籤
+def draw_box_with_label(display_image, x0, y0, x1, y1, label_text):
+  cv2.rectangle(display_image, (x0, y0), (x1, y1), (18, 127, 15), 2)
+
+  font = cv2.FONT_HERSHEY_SIMPLEX
+  font_scale = 0.5
+  ((text_w, text_h), _) = cv2.getTextSize(label_text, font, font_scale, 1)
+  back_tl = (x0, max(0, y0 - int(1.4 * text_h)))
+  back_br = (x0 + text_w + 6, max(text_h + 4, y0))
+  cv2.rectangle(display_image, back_tl, back_br, (18, 127, 15), -1)
+  cv2.putText(
+      display_image,
+      label_text,
+      (x0 + 3, max(text_h + 1, y0 - int(0.4 * text_h))),
+      font,
+      font_scale,
+      (255, 255, 255),
+      1,
+      cv2.LINE_AA,
+  )
+
+
+# 依目前 dataset 與標籤紀錄重建 LBPH 模型；若無資料則清理模型檔
+def rebuild_model_files(current_label_map):
+  dataset_path = os.path.join(MODEL_DIR, "dataset")
+  all_faces = []
+  all_ids = []
+  new_label_map = {}
+
+  if os.path.exists(dataset_path):
+    name_list = sorted(
+        [
+            d
+            for d in os.listdir(dataset_path)
+            if os.path.isdir(os.path.join(dataset_path, d))
+        ]
+    )
+    for current_id, name in enumerate(name_list):
+      existing_code = ""
+      for _, v in current_label_map.items():
+        if v.get("name") == name:
+          existing_code = v.get("code", "")
+          break
+      new_label_map[current_id] = {"name": name, "code": existing_code}
+
+      person_dir = os.path.join(dataset_path, name)
+      for img_name in os.listdir(person_dir):
+        if img_name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+          img_path = os.path.join(person_dir, img_name)
+          try:
+            pil_img = Image.open(img_path).convert("L")
+            all_faces.append(np.array(pil_img))
+            all_ids.append(current_id)
+          except Exception:
+            pass
+
+  if len(all_faces) == 1:
+    all_faces.append(cv2.flip(all_faces[0], 1))
+    all_ids.append(all_ids[0])
+
+  if len(all_faces) > 0:
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.train(all_faces, np.array(all_ids))
+    recognizer.save(MODEL_PATH)
+    with open(LABELS_PATH, "wb") as f:
+      pickle.dump(new_label_map, f)
+  else:
+    for path in (MODEL_PATH, LABELS_PATH):
+      if os.path.exists(path):
+        os.remove(path)
+
+
 # ------------------ Streamlit 介面佈局與 CSS 樣式優化 ------------------
 st.set_page_config(page_title="AI 綜合智慧辨識與人臉學習系統", layout="centered")
 
 st.markdown(
     """
     <style>
-    /* 將側邊欄單選按鈕美化成現代化區塊按鈕，徹底避開 selectbox 的游標與紅框問題 */
     div.row-widget.stRadio > div {
         flex-direction: column;
         gap: 8px;
@@ -226,11 +352,15 @@ st.markdown(
 
 st.title("🧠 AI 綜合智慧辨識與人臉學習系統")
 
-# 側邊欄導航：改用 st.radio 並賦予精美按鈕外觀，解決所有邊框與游標問題
 st.sidebar.markdown("### 導航選單")
 menu = st.sidebar.radio(
     "選擇功能模式",
-    ["1. 註冊與訓練新人物", "2. 綜合識別與人臉測試", "3. 管理與修改已儲存模型"],
+    [
+        "1. 註冊與訓練新人物",
+        "2. COCO 物件識別",
+        "3. 機器學習人臉識別",
+        "4. 管理與修改已儲存模型",
+    ],
     label_visibility="collapsed",
 )
 
@@ -276,8 +406,7 @@ if menu == "1. 註冊與訓練新人物":
             label_map = {}
 
         person_folder = os.path.join(MODEL_DIR, "dataset", person_name)
-        if not os.path.exists(person_folder):
-          os.makedirs(person_folder)
+        os.makedirs(person_folder, exist_ok=True)
 
         for uploaded_file in uploaded_files:
           try:
@@ -290,59 +419,20 @@ if menu == "1. 註冊與訓練新人物":
           except Exception:
             pass
 
-        all_faces = []
-        all_ids = []
-        new_label_map = {}
-        dataset_path = os.path.join(MODEL_DIR, "dataset")
+        temp_map = dict(label_map)
+        updated_existing = False
+        for k, v in temp_map.items():
+          if v.get("name") == person_name:
+            temp_map[k] = {"name": person_name, "code": person_code}
+            updated_existing = True
+            break
+        if not updated_existing:
+          next_id = (max(temp_map.keys()) + 1) if temp_map else 0
+          temp_map[next_id] = {"name": person_name, "code": person_code}
 
-        if os.path.exists(dataset_path):
-          name_list = sorted(
-              [
-                  d
-                  for d in os.listdir(dataset_path)
-                  if os.path.isdir(os.path.join(dataset_path, d))
-              ]
-          )
+        rebuild_model_files(temp_map)
 
-          for current_id, name in enumerate(name_list):
-            existing_code = ""
-            for k, v in label_map.items():
-              if v.get("name") == name:
-                existing_code = v.get("code", "")
-                break
-            if name == person_name:
-              existing_code = person_code
-
-            new_label_map[current_id] = {"name": name, "code": existing_code}
-
-            person_dir = os.path.join(dataset_path, name)
-            for img_name in os.listdir(person_dir):
-              if img_name.lower().endswith(
-                  (".png", ".jpg", ".jpeg", ".webp")
-              ):
-                img_path = os.path.join(person_dir, img_name)
-                try:
-                  pil_img = Image.open(img_path).convert("L")
-                  img_np = np.array(pil_img)
-                  all_faces.append(img_np)
-                  all_ids.append(current_id)
-                except Exception:
-                  pass
-
-          if len(new_label_map) > 0:
-            label_map = new_label_map
-
-        if len(all_faces) == 1:
-          all_faces.append(cv2.flip(all_faces[0], 1))
-          all_ids.append(all_ids[0])
-
-        if len(all_faces) > 0:
-          recognizer = cv2.face.LBPHFaceRecognizer_create()
-          recognizer.train(all_faces, np.array(all_ids))
-          recognizer.save(MODEL_PATH)
-          with open(LABELS_PATH, "wb") as f:
-            pickle.dump(label_map, f)
-
+        if os.path.exists(MODEL_PATH) and os.path.exists(LABELS_PATH):
           st.success(
               f"🎉 成功為「{person_name}」完成訓練與資料累積！模型已更新並儲存。"
           )
@@ -350,88 +440,36 @@ if menu == "1. 註冊與訓練新人物":
         else:
           st.error("訓練資料不足！請確認上傳的圖片檔案格式正確。")
 
-# ------------------ 功能二：綜合識別與人臉測試 ------------------
-elif menu == "2. 綜合識別與人臉測試":
-  st.header("🔍 步驟二：上傳照片進行綜合辨識")
-  st.write(
-      "上傳照片後，若成功匹配自定義人臉模型將進行點名並輸出下方文字；若為陌生人或一般物件則僅顯示純淨標註框。"
+# ------------------ 功能二：COCO 物件識別 ------------------
+elif menu == "2. COCO 物件識別":
+  st.header("📦 COCO 物件識別")
+  st.write("上傳照片進行通用物件檢測，僅顯示標註框，不輸出下方點名文字。")
+
+  coco_file = st.file_uploader(
+      "上傳要進行物件識別的照片",
+      type=["jpg", "jpeg", "png", "webp"],
+      key="coco_uploader",
   )
 
-  test_file = st.file_uploader(
-      "上傳要辨識的照片", type=["jpg", "jpeg", "png", "webp"]
-  )
-
-  if st.button("🚀 開始綜合辨識", type="primary"):
-    if test_file is None:
-      st.error("請先上傳測試圖片！")
+  if st.button("🚀 開始 COCO 物件識別", type="primary", key="btn_coco"):
+    if coco_file is None:
+      st.error("請先上傳圖片！")
     else:
-      with st.spinner("AI 正在進行智慧識別與標註中..."):
+      with st.spinner("AI 正在辨識 COCO 物件中..."):
         det_model = load_detection_model()
-        image = Image.open(test_file).convert("RGB")
-
-        transform = trns.ToTensor()
-        image_tensor = transform(image)
+        image = Image.open(coco_file).convert("RGB")
+        image_tensor = trns.ToTensor()(image)
 
         with torch.no_grad():
           predictions = det_model([image_tensor])[0]
 
-        display_image = np.array(image).astype(np.float32)
-        gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
-
-        recognizer = None
-        label_map = {}
-        has_custom_model = False
-        if os.path.exists(MODEL_PATH) and os.path.exists(LABELS_PATH):
-          try:
-            recognizer = cv2.face.LBPHFaceRecognizer_create()
-            recognizer.read(MODEL_PATH)
-            with open(LABELS_PATH, "rb") as f:
-              loaded_data = pickle.load(f)
-
-            for k, v in loaded_data.items():
-              if isinstance(v, str):
-                label_map[k] = {"name": v, "code": ""}
-              else:
-                label_map[k] = v
-
-            if len(label_map) > 0:
-              has_custom_model = True
-          except Exception:
-            pass
-
+        display_image = np.array(image).astype(np.uint8)
         boxes = predictions["boxes"].cpu().numpy()
         labels = predictions["labels"].cpu().numpy()
         scores = predictions["scores"].cpu().numpy()
 
-        # 【強力 NMS 與重複框過濾】：嚴格過濾多人合照時產生的多餘重疊框
-        valid_indices = []
-        for i, (bbox, label_idx, score) in enumerate(zip(boxes, labels, scores)):
-          eng_name = _COCO_INSTANCE_CATEGORY_NAMES[label_idx]
-          if score >= 0.7:  # 提高信心門檻，過濾掉低品質雜訊框
-            if eng_name == "person":
-              is_redundant = False
-              for j in valid_indices:
-                jb = boxes[j]
-                inter_x0 = max(bbox[0], jb[0])
-                inter_y0 = max(bbox[1], jb[1])
-                inter_x1 = min(bbox[2], jb[2])
-                inter_y1 = min(bbox[3], jb[3])
-                inter_area = max(0, inter_x1 - inter_x0) * max(
-                    0, inter_y1 - inter_y0
-                )
-                box_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                # 若重疊面積大於 30%，視為同一個人的重複冗餘框，直接濾除
-                if inter_area / (box_area + 1e-5) > 0.3:
-                  is_redundant = True
-                  break
-              if not is_redundant:
-                valid_indices.append(i)
-            else:
-              if score >= 0.6:
-                valid_indices.append(i)
-
+        valid_indices = filter_valid_indices(boxes, labels, scores)
         detected_count = 0
-        detection_records = []
 
         for i in valid_indices:
           bbox = boxes[i]
@@ -443,58 +481,11 @@ elif menu == "2. 綜合識別與人臉測試":
           zh_name = _COCO_ZH_NAMES.get(eng_name, eng_name)
           label_text = f"{zh_name} ({int(score * 100)}%)"
 
-          if eng_name == "person" and recognizer is not None and has_custom_model:
-            box_h = y1 - y0
-            face_y1 = y0 + int(box_h * 0.75)
-            person_crop_gray = gray[y0:face_y1, x0:x1]
-
-            if person_crop_gray.size > 100:
-              try:
-                face_resized = cv2.resize(person_crop_gray, (200, 200))
-                p_id, conf = recognizer.predict(face_resized)
-
-                # 寬鬆合理的信心閥值 (conf < 110)，確保資料庫內的人絕對能精準辨識
-                if p_id in label_map and conf < 110:
-                  person_info = label_map.get(p_id)
-                  custom_name = person_info["name"]
-                  custom_code = person_info.get("code", "")
-                  sim_score = max(0, int(100 - conf / 1.5))
-                  label_text = f"{custom_name} ({sim_score}%)"
-
-                  detection_records.append(
-                      {"name": custom_name, "code": custom_code}
-                  )
-                else:
-                  label_text = "未知人物"
-              except Exception:
-                pass
-
-          display_image = display_image.astype(np.uint8)
-          cv2.rectangle(display_image, (x0, y0), (x1, y1), (18, 127, 15), 2)
-
-          font = cv2.FONT_HERSHEY_SIMPLEX
-          font_scale = 0.5
-          ((text_w, text_h), _) = cv2.getTextSize(
-              label_text, font, font_scale, 1
-          )
-          back_tl = x0, y0 - int(1.4 * text_h)
-          back_br = x0 + text_w + 6, y0
-          cv2.rectangle(display_image, back_tl, back_br, (18, 127, 15), -1)
-          cv2.putText(
-              display_image,
-              label_text,
-              (x0 + 3, y0 - int(0.4 * text_h)),
-              font,
-              font_scale,
-              (255, 255, 255),
-              1,
-              cv2.LINE_AA,
-          )
+          draw_box_with_label(display_image, x0, y0, x1, y1, label_text)
           detected_count += 1
 
         if detected_count == 0:
           h_img, w_img, _ = display_image.shape
-          display_image = display_image.astype(np.uint8)
           cv2.rectangle(
               display_image,
               (10, 10),
@@ -513,32 +504,108 @@ elif menu == "2. 綜合識別與人臉測試":
               cv2.LINE_AA,
           )
 
-        display_image = display_image.astype(np.uint8)
         st.image(
-            display_image, caption="AI 智慧辨識結果", use_container_width=True
+            display_image, caption="COCO 物件識別結果", use_container_width=True
         )
 
-        if has_custom_model and len(detection_records) > 0:
-          total_count = len(detection_records)
-          fen_bie_str = "分別" if total_count > 1 else ""
+# ------------------ 功能三：機器學習人臉識別 ------------------
+elif menu == "3. 機器學習人臉識別":
+  st.header("🧑‍💼 機器學習人臉識別")
+  st.write(
+      "上傳照片比對已訓練的人物模型；只有匹配到自定義模型的人物才會在下方輸出點名文字。"
+  )
 
-          result_lines = [
-              f"成功偵測並分析 {total_count} 個臉部目標！",
-              f"目標{fen_bie_str}為：",
+  ml_file = st.file_uploader(
+      "上傳要進行人臉識別的照片",
+      type=["jpg", "jpeg", "png", "webp"],
+      key="ml_uploader",
+  )
+
+  if st.button("🚀 開始機器學習人臉識別", type="primary", key="btn_ml"):
+    if ml_file is None:
+      st.error("請先上傳圖片！")
+    else:
+      recognizer, label_map, has_custom_model = load_face_model()
+      if not has_custom_model or recognizer is None:
+        st.warning("目前尚無已儲存的人物模型，請先前往「1. 註冊與訓練新人物」。")
+      else:
+        with st.spinner("AI 正在進行機器學習人臉比對中..."):
+          det_model = load_detection_model()
+          image = Image.open(ml_file).convert("RGB")
+          image_tensor = trns.ToTensor()(image)
+
+          with torch.no_grad():
+            predictions = det_model([image_tensor])[0]
+
+          display_image = np.array(image).astype(np.uint8)
+          gray = cv2.cvtColor(display_image, cv2.COLOR_RGB2GRAY)
+
+          boxes = predictions["boxes"].cpu().numpy()
+          labels = predictions["labels"].cpu().numpy()
+          scores = predictions["scores"].cpu().numpy()
+
+          person_indices = [
+              i
+              for i in filter_valid_indices(boxes, labels, scores)
+              if _COCO_INSTANCE_CATEGORY_NAMES[labels[i]] == "person"
           ]
 
-          for rec in detection_records:
-            p_name = rec["name"]
-            p_code = rec["code"]
-            if p_code and p_code.strip():
-              result_lines.append(f"{p_name} 編號:{p_code}")
-            else:
-              result_lines.append(f"{p_name}")
+          detection_records = []
 
-          st.success("\n\n".join(result_lines))
+          for i in person_indices:
+            x0, y0, x1, y1 = map(int, boxes[i])
+            box_h = y1 - y0
+            face_y1 = y0 + int(box_h * 0.75)
+            person_crop_gray = gray[y0:face_y1, x0:x1]
 
-# ------------------ 功能三：管理與修改已儲存模型 ------------------
-elif menu == "3. 管理與修改已儲存模型":
+            label_text = "未知人物"
+            if person_crop_gray.size > 100:
+              try:
+                face_resized = cv2.resize(person_crop_gray, (200, 200))
+                p_id, conf = recognizer.predict(face_resized)
+
+                if p_id in label_map and conf < 110:
+                  person_info = label_map.get(p_id)
+                  custom_name = person_info["name"]
+                  custom_code = person_info.get("code", "")
+                  sim_score = max(0, int(100 - conf / 1.5))
+                  label_text = f"{custom_name} ({sim_score}%)"
+
+                  detection_records.append(
+                      {"name": custom_name, "code": custom_code}
+                  )
+              except Exception:
+                pass
+
+            draw_box_with_label(display_image, x0, y0, x1, y1, label_text)
+
+          st.image(
+              display_image,
+              caption="機器學習人臉識別結果",
+              use_container_width=True,
+          )
+
+          if len(detection_records) > 0:
+            total_count = len(detection_records)
+            fen_bie_str = "分別" if total_count > 1 else ""
+
+            result_lines = [
+                f"成功偵測並分析 {total_count} 個臉部目標！",
+                f"目標{fen_bie_str}為：",
+            ]
+
+            for rec in detection_records:
+              p_name = rec["name"]
+              p_code = rec.get("code", "")
+              if p_code and p_code.strip():
+                result_lines.append(f"{p_name} 編號:{p_code}")
+              else:
+                result_lines.append(f"{p_name}")
+
+            st.success("\n\n".join(result_lines))
+
+# ------------------ 功能四：管理與修改已儲存模型 ------------------
+elif menu == "4. 管理與修改已儲存模型":
   st.header("⚙️ 管理與修改已儲存的模型資料")
 
   if not os.path.exists(LABELS_PATH) or not os.path.exists(MODEL_PATH):
@@ -556,7 +623,7 @@ elif menu == "3. 管理與修改已儲存模型":
 
     st.write(f"目前共儲存了 **{len(label_map)}** 位人物模型：")
 
-    for idx, (p_id, p_info) in enumerate(label_map.items()):
+    for idx, (_, p_info) in enumerate(label_map.items()):
       p_name = p_info["name"]
       p_code = p_info.get("code", "")
       code_str = p_code if p_code else "無"
@@ -596,7 +663,6 @@ elif menu == "3. 管理與修改已儲存模型":
           if os.path.exists(old_folder):
             if old_folder != new_folder:
               if os.path.exists(new_folder):
-                import shutil
                 shutil.rmtree(new_folder)
               os.rename(old_folder, new_folder)
 
@@ -610,71 +676,16 @@ elif menu == "3. 管理與修改已儲存模型":
 
     with col2:
       if st.button("🗑️ 刪除此人物模型", type="secondary"):
-        import shutil
-
         target_folder = os.path.join(MODEL_DIR, "dataset", selected_name)
         if os.path.exists(target_folder):
           shutil.rmtree(target_folder)
 
-        del label_map[selected_id]
+        updated_label_map = {
+            k: v
+            for k, v in label_map.items()
+            if v.get("name") != selected_name
+        }
+        rebuild_model_files(updated_label_map)
 
-        if len(label_map) > 0:
-          all_faces = []
-          all_ids = []
-          dataset_path = os.path.join(MODEL_DIR, "dataset")
-          new_label_map = {}
-
-          name_list = sorted(
-              [
-                  d
-                  for d in os.listdir(dataset_path)
-                  if os.path.isdir(os.path.join(dataset_path, d))
-              ]
-          )
-          for current_id, name in enumerate(name_list):
-            existing_code = ""
-            for k, v in label_map.items():
-              if v.get("name") == name:
-                existing_code = v.get("code", "")
-                break
-
-            new_label_map[current_id] = {"name": name, "code": existing_code}
-            person_dir = os.path.join(dataset_path, name)
-            for img_name in os.listdir(person_dir):
-              if img_name.lower().endswith(
-                  (".png", ".jpg", ".jpeg", ".webp")
-              ):
-                img_path = os.path.join(person_dir, img_name)
-                try:
-                  pil_img = Image.open(img_path).convert("L")
-                  img_np = np.array(pil_img)
-                  all_faces.append(img_np)
-                  all_ids.append(current_id)
-                except Exception:
-                  pass
-
-          label_map = new_label_map
-
-          if len(all_faces) == 1:
-            all_faces.append(cv2.flip(all_faces[0], 1))
-            all_ids.append(all_ids[0])
-
-          if len(all_faces) > 0:
-            recognizer = cv2.face.LBPHFaceRecognizer_create()
-            recognizer.train(all_faces, np.array(all_ids))
-            recognizer.save(MODEL_PATH)
-            with open(LABELS_PATH, "wb") as f:
-              pickle.dump(label_map, f)
-          else:
-            if os.path.exists(MODEL_PATH):
-              os.remove(MODEL_PATH)
-            if os.path.exists(LABELS_PATH):
-              os.remove(LABELS_PATH)
-        else:
-          if os.path.exists(MODEL_PATH):
-            os.remove(MODEL_PATH)
-          if os.path.exists(LABELS_PATH):
-            os.remove(LABELS_PATH)
-
-        st.success(f"已成功刪除「{selected_name}」的模型資料！")
+        st.success(f"已成功刪除「{selected_name}」並更新模型！")
         st.rerun()
